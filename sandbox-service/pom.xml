@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>ai.festcloud.adkpoc</groupId>
+    <artifactId>adk-mcp-sandbox-service</artifactId>
+    <version>0.1.0</version>
+  </parent>
+
+  <artifactId>sandbox-service</artifactId>
+
+  <!--
+    Deliberately NOT Spring Boot, same reasoning as adk-mcp-sandbox's sandbox-bridge:
+    this runs inside the container whose cold start IS the thing being measured. Uses
+    the JDK's built-in com.sun.net.httpserver.HttpServer instead of a WebSocket client —
+    a Service accepts inbound HTTP directly, so there's no outbound-connection library
+    to depend on at all here.
+  -->
+  <dependencies>
+    <!-- Real ADK MCP client — the exact same com.google.adk.tools.mcp code path
+         adk-mcp-sandbox's sandbox-bridge uses (McpBridge.java is an unmodified copy).
+         Restored per request: only the transport TO this container changes
+         (HTTP instead of WebSocket), not how it talks to the stdio subprocess. -->
+    <dependency>
+      <groupId>com.google.adk</groupId>
+      <artifactId>google-adk</artifactId>
+      <version>${google-adk.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>${slf4j.version}</version>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <finalName>sandbox-service</finalName>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-shade-plugin</artifactId>
+        <version>3.6.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals>
+              <goal>shade</goal>
+            </goals>
+            <configuration>
+              <filters>
+                <filter>
+                  <artifact>*:*</artifact>
+                  <excludes>
+                    <exclude>META-INF/*.SF</exclude>
+                    <exclude>META-INF/*.DSA</exclude>
+                    <exclude>META-INF/*.RSA</exclude>
+                  </excludes>
+                </filter>
+              </filters>
+              <transformers>
+                <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
+                  <mainClass>poc.mcp.sandboxservice.SandboxServiceMain</mainClass>
+                </transformer>
+              </transformers>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
