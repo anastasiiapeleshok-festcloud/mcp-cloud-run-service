@@ -14,6 +14,16 @@
 
   <dependencyManagement>
     <dependencies>
+      <!-- The MCP SDK's Jackson 3 JSON mapper (used by the Cloud Run MCP transport, see
+           CloudRunStdioTransport) calls JsonProperty.isRequired(), which only exists in
+           jackson-annotations 2.20+. Spring Boot's BOM pins 2.17.x, which fails at runtime with
+           NoSuchMethodError on the first MCP message. Declared BEFORE the BOM import so it wins;
+           annotations are backward compatible with the 2.17 databind Spring Boot ships. -->
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-annotations</artifactId>
+        <version>2.20</version>
+      </dependency>
       <dependency>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-dependencies</artifactId>

@@ -90,6 +90,19 @@ public class SandboxSessionManager {
    *  MCP subprocess; later calls in the same turn are a same-map-key no-op. */
   public void ensureActiveSandbox(String sessionKey, String mcpCommand, List<String> mcpArgs,
       Map<String, String> mcpEnv) throws Exception {
+    ensureActive(sessionKey, mcpCommand, mcpArgs, mcpEnv, false);
+  }
+
+  /** Same as {@link #ensureActiveSandbox}, but the Service only spawns the stdio process and
+   *  does NOT run the MCP handshake itself — the caller's own MCP client does, through
+   *  {@link #relayRpc}. Used by CloudRunStdioTransport. */
+  public void ensureActiveRelaySandbox(String sessionKey, String mcpCommand, List<String> mcpArgs,
+      Map<String, String> mcpEnv) throws Exception {
+    ensureActive(sessionKey, mcpCommand, mcpArgs, mcpEnv, true);
+  }
+
+  private void ensureActive(String sessionKey, String mcpCommand, List<String> mcpArgs,
+      Map<String, String> mcpEnv, boolean relay) throws Exception {
     boolean[] wasAlreadyUp = {true};
     Exception[] failure = new Exception[1];
     long t0 = System.currentTimeMillis();
@@ -97,7 +110,7 @@ public class SandboxSessionManager {
     provisionedSessions.computeIfAbsent(sessionKey, key -> {
       wasAlreadyUp[0] = false;
       try {
-        startSession(key, mcpCommand, mcpArgs, mcpEnv);
+        startSession(key, mcpCommand, mcpArgs, mcpEnv, relay);
         return true;
       } catch (Exception e) {
         failure[0] = e; // returning null below means computeIfAbsent won't record this key —
@@ -213,6 +226,28 @@ public class SandboxSessionManager {
     return tools;
   }
 
+  /** Forwards ONE raw JSON-RPC message to the sandbox's stdio process via {@code /mcp/rpc}.
+   *  Returns the raw JSON-RPC reply, or null when the message has none (a notification). */
+  public String relayRpc(String sessionKey, String jsonRpcMessage) throws Exception {
+    ObjectNode envelope = objectMapper.createObjectNode();
+    envelope.put("sessionId", sessionKey);
+    envelope.set("message", objectMapper.readTree(jsonRpcMessage));
+
+    HttpResponse<String> response = send("/mcp/rpc", envelope.toString(), sessionKey, CALL_TIMEOUT);
+    if (response.statusCode() == 409) {
+      throw new IllegalStateException("Sandbox lost for " + sessionKey + ": " + response.body());
+    }
+    if (response.statusCode() == 202 || response.statusCode() == 204) {
+      return null;
+    }
+    if (response.statusCode() != 200) {
+      throw new IllegalStateException(
+          "Sandbox MCP relay failed for " + sessionKey + ": HTTP " + response.statusCode()
+              + " — " + response.body());
+    }
+    return response.body();
+  }
+
   public void destroySandbox(String sessionKey) {
     if (!provisionedSessions.containsKey(sessionKey)) {
       return; // this turn never touched the sandbox — nothing to tear down
@@ -233,12 +268,13 @@ public class SandboxSessionManager {
   }
 
   private void startSession(String sessionKey, String mcpCommand, List<String> mcpArgs,
-      Map<String, String> mcpEnv) throws Exception {
+      Map<String, String> mcpEnv, boolean relay) throws Exception {
     ObjectNode body = objectMapper.createObjectNode();
     body.put("sessionId", sessionKey);
     body.put("mcpCommand", mcpCommand);
     body.set("mcpArgs", objectMapper.valueToTree(mcpArgs));
     body.set("mcpEnv", objectMapper.valueToTree(mcpEnv));
+    body.put("relay", relay);
 
     long t0 = System.currentTimeMillis();
     HttpRequest request = requestBuilder("/session/start", START_TIMEOUT)

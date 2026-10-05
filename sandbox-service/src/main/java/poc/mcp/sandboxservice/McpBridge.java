@@ -22,7 +22,7 @@ import org.slf4j.LoggerFactory;
  * variant) or plain HTTP (this Service variant) — see SandboxServiceMain for the only
  * thing that actually changed: how a caller reaches this class.
  */
-public class McpBridge {
+public class McpBridge implements SandboxSession {
 
   private static final Logger log = LoggerFactory.getLogger(McpBridge.class);
 
@@ -63,6 +63,7 @@ public class McpBridge {
     return toJsonFriendlyResult(result);
   }
 
+  @Override
   public void close() {
     if (mcpClient != null) {
       mcpClient.close();

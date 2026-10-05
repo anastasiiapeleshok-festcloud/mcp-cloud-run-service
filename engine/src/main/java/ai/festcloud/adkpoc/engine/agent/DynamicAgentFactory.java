@@ -1,17 +1,23 @@
 package ai.festcloud.adkpoc.engine.agent;
 
-import ai.festcloud.adkpoc.engine.sandbox.DynamicSandboxMcpTool;
+import ai.festcloud.adkpoc.engine.sandbox.CloudRunStdioTransport;
 import ai.festcloud.adkpoc.engine.sandbox.SandboxSessionManager;
+import com.google.adk.JsonBaseModel;
 import com.google.adk.agents.LlmAgent;
 import com.google.adk.artifacts.BaseArtifactService;
 import com.google.adk.memory.BaseMemoryService;
 import com.google.adk.plugins.LoggingPlugin;
 import com.google.adk.runner.Runner;
 import com.google.adk.sessions.BaseSessionService;
-import com.google.adk.tools.BaseTool;
+import com.google.adk.tools.mcp.McpSessionManager;
+import com.google.adk.tools.mcp.McpToolset;
+import com.google.adk.tools.mcp.StdioConnectionParameters;
+import com.google.adk.tools.mcp.StdioServerParameters;
+import io.modelcontextprotocol.client.transport.ServerParameters;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -73,27 +79,36 @@ public class DynamicAgentFactory {
     this.memoryService = memoryService;
   }
 
-  /** Starts the sandbox for {@code sessionKey}, discovers its real tool set, and builds
-   *  a fresh Runner wired to exactly those tools. Caller owns tearing the sandbox down
-   *  (via SandboxSessionManager.destroySandbox(sessionKey)) once the turn is done. */
+  /** Builds a fresh Runner whose operaton_agent uses a stock McpToolset over the Cloud Run
+   *  transport. The sandbox itself starts lazily, on first use of the toolset. Caller owns
+   *  tearing it down (via SandboxSessionManager.destroySandbox(sessionKey)) once the turn
+   *  is done. */
   public Runner buildRunnerForSession(String sessionKey) throws Exception {
     McpServerSpec spec = resolveMcpServer();
     log.info("{} — spawning MCP server '{}' ({} {})", sessionKey, mcpServer, spec.command(), spec.args());
 
-    sessionManager.ensureActiveSandbox(sessionKey, spec.command(), spec.args(), spec.env());
-    List<Map<String, Object>> discoveredTools = sessionManager.listTools(sessionKey);
-    log.info("{} — building agent with {} dynamically discovered MCP tools", sessionKey,
-        discoveredTools.size());
-
-    List<BaseTool> tools = discoveredTools.stream()
-        .<BaseTool>map(tool -> toDynamicTool(sessionKey, tool))
-        .toList();
+    // The stock ADK McpToolset, unchanged — only its transport is ours: instead of spawning
+    // the stdio process locally it asks the Cloud Run Service to spawn it and tunnels the
+    // JSON-RPC over HTTP. Nothing is started here: the sandbox is spun up lazily, the first
+    // time the agent actually needs the tool list (see CloudRunStdioTransport.connect).
+    StdioConnectionParameters connection = StdioConnectionParameters.builder()
+        .serverParams(StdioServerParameters.builder()
+            .command(spec.command())
+            .args(spec.args())
+            .env(spec.env())
+            .build())
+        .timeout(90f) // MCP initialize budget, includes the Cloud Run cold start
+        .build();
+    McpSessionManager mcpSessions = new McpSessionManager(connection,
+        // ADK has already turned StdioConnectionParameters into the SDK's ServerParameters
+        // (command/args/env) by the time it asks for a transport.
+        params -> new CloudRunStdioTransport(sessionManager, sessionKey, (ServerParameters) params));
+    McpToolset toolset = new McpToolset(mcpSessions, JsonBaseModel.getMapper());
 
     LlmAgent operatonAgent = LlmAgent.builder()
         .name("operaton_agent")
-        .description("Handles domain queries via MCP tools discovered live from the "
-            + "sandboxed MCP server for this request — the full tool surface it exposes, "
-            + "not a fixed subset.")
+        .description("Handles domain queries via the MCP server's tools, discovered live "
+            + "from the sandboxed MCP server for this request.")
         .model("gemini-3.8-flash")
         .instruction("""
             You have direct access to tools that were just discovered live from the
@@ -101,7 +116,7 @@ public class DynamicAgentFactory {
             asked for, with the arguments its own schema requires. Report back exactly what
             the tool returned.
             """)
-        .tools(tools)
+        .tools(toolset)
         .build();
 
     LlmAgent orchestratorAgent = LlmAgent.builder()
@@ -142,13 +157,4 @@ public class DynamicAgentFactory {
   }
 
   private record McpServerSpec(String command, List<String> args, Map<String, String> env) {}
-
-  @SuppressWarnings("unchecked")
-  private DynamicSandboxMcpTool toDynamicTool(String sessionKey, Map<String, Object> tool) {
-    String name = (String) tool.get("name");
-    String description = (String) tool.getOrDefault("description", "");
-    Map<String, Object> inputSchema = (Map<String, Object>) tool.getOrDefault(
-        "inputSchema", Map.of("type", "object", "properties", Map.of()));
-    return new DynamicSandboxMcpTool(sessionManager, sessionKey, name, description, inputSchema);
-  }
 }

@@ -4,6 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import io.modelcontextprotocol.spec.McpSchema;
+import io.modelcontextprotocol.spec.McpSchema.JSONRPCMessage;
+import io.modelcontextprotocol.spec.McpSchema.JSONRPCResponse;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
@@ -43,7 +46,7 @@ public class SandboxServiceMain {
   private static final Object LOCK = new Object();
 
   private static volatile String activeSessionId;
-  private static volatile McpBridge activeBridge;
+  private static volatile SandboxSession activeBridge;
   // Updated on every /session/start, /mcp, and /session/close touching the active
   // session — lets a /session/start conflict self-heal instead of rejecting forever.
   // See handleSessionStart: without this, a session whose /session/close call suffers a
@@ -65,6 +68,7 @@ public class SandboxServiceMain {
     server.createContext("/healthz", exchange -> writeJson(exchange, 200, Map.of("status", "ok")));
     server.createContext("/session/start",
         exchange -> handleSessionStart(exchange, staleSessionTimeoutMillis));
+    server.createContext("/mcp/rpc", SandboxServiceMain::handleMcpRpc);
     server.createContext("/mcp", SandboxServiceMain::handleMcp);
     server.createContext("/session/close", exchange -> handleSessionClose(exchange, exitAfterSession));
 
@@ -124,9 +128,18 @@ public class SandboxServiceMain {
         activeSessionId = null;
       }
 
-      McpBridge bridge = new McpBridge();
+      boolean relayMode = body.path("relay").asBoolean(false);
+      SandboxSession bridge;
       try {
-        bridge.start(mcpCommand, mcpArgs, mcpEnv);
+        if (relayMode) {
+          StdioRelay relay = new StdioRelay();
+          relay.start(mcpCommand, mcpArgs, mcpEnv);
+          bridge = relay;
+        } else {
+          McpBridge typed = new McpBridge();
+          typed.start(mcpCommand, mcpArgs, mcpEnv);
+          bridge = typed;
+        }
       } catch (Exception e) {
         log.error("Failed to start MCP subprocess for session {}", sessionId, e);
         writeJson(exchange, 500, Map.of("error", e.getMessage() != null ? e.getMessage() : e.toString()));
@@ -158,8 +171,8 @@ public class SandboxServiceMain {
     String id = message.path("id").asText();
     String method = message.path("method").asText();
 
-    McpBridge bridge = activeBridge;
-    if (bridge == null || !sessionId.equals(activeSessionId)) {
+    SandboxSession active = activeBridge;
+    if (!(active instanceof McpBridge bridge) || !sessionId.equals(activeSessionId)) {
       // Session-affinity miss (instance evicted/scaled down mid-turn) or the session was
       // never started on the instance we landed on. Engine treats 409 as "sandbox lost",
       // same failure mode as the Job variant's "sandbox never connected" timeout.
@@ -196,6 +209,51 @@ public class SandboxServiceMain {
       log.error("MCP call '{}' failed", method, e);
       writeJson(exchange, 200, Map.of("jsonrpc", "2.0", "id", id, "error", Map.of(
           "message", e.getMessage() != null ? e.getMessage() : e.toString())));
+    }
+  }
+
+  /**
+   * Raw MCP relay for a stock ADK {@code McpToolset} running in Engine. Body is {@code
+   * {"sessionId": "...", "message": <one JSON-RPC message>}}. The message goes to the stdio
+   * process untouched; the HTTP response body is the process's matching JSON-RPC reply, or
+   * 202 with no body when the message has none (a notification).
+   */
+  private static void handleMcpRpc(HttpExchange exchange) throws IOException {
+    if (!"POST".equals(exchange.getRequestMethod())) {
+      exchange.sendResponseHeaders(405, -1);
+      return;
+    }
+    JsonNode body = MAPPER.readTree(exchange.getRequestBody());
+    String sessionId = body.path("sessionId").asText();
+
+    SandboxSession active = activeBridge;
+    if (!(active instanceof StdioRelay relay) || !sessionId.equals(activeSessionId)) {
+      log.warn("Rejecting /mcp/rpc for {} — this instance's active session is {}", sessionId,
+          activeSessionId);
+      writeJson(exchange, 409, Map.of("error", "no active relay session " + sessionId
+          + " on this instance"));
+      return;
+    }
+
+    lastActivityAtMillis = System.currentTimeMillis();
+    try {
+      JSONRPCMessage message = McpSchema.deserializeJsonRpcMessage(
+          relay.jsonMapper(), body.path("message").toString());
+      JSONRPCResponse reply = relay.relay(message);
+      lastActivityAtMillis = System.currentTimeMillis();
+      if (reply == null) {
+        exchange.sendResponseHeaders(202, -1);
+        return;
+      }
+      byte[] bytes = relay.jsonMapper().writeValueAsBytes(reply);
+      exchange.getResponseHeaders().set("Content-Type", "application/json");
+      exchange.sendResponseHeaders(200, bytes.length);
+      try (OutputStream os = exchange.getResponseBody()) {
+        os.write(bytes);
+      }
+    } catch (Exception e) {
+      log.error("MCP relay failed", e);
+      writeJson(exchange, 500, Map.of("error", e.getMessage() != null ? e.getMessage() : e.toString()));
     }
   }
 
